@@ -147,6 +147,9 @@ L5 / R5, both trackpads); only **⋯** stays reserved for the plugin, unless you
 ### Options
 
 - **Turn off screen while connected**
+- **Keep the Deck awake while connected** (on by default): the Deck doesn't see you using the
+  controller, so without this it goes to sleep mid game when its sleep timer runs out. The
+  sleep timers are set to never while connected and put back when it disconnects.
 - **Send ⋯ to your device** (Steam Controller type only): **⋯** works as the controller's own
   **⋯** button, e.g. to open the Quick Access Menu on a SteamOS PC. **Steam + ⋯** then turns the
   Deck screen on or off, and holding **⋯** for 2 seconds still stops.

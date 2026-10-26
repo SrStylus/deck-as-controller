@@ -23,6 +23,7 @@ import {
 import { useEffect, useState } from "react";
 import { FaGamepad } from "react-icons/fa";
 import { ScreenBlanker, disposeBlanker } from "./blanker";
+import { keepAwake } from "./keepawake";
 
 type Host = { address: string; name: string; profile: string };
 type ProfileInfo = { id: string; label: string; usb: boolean; qam: boolean };
@@ -53,6 +54,7 @@ type State = {
         screen_off: boolean;
         pad_haptics: boolean;
         qam_to_host: boolean;
+        keep_awake: boolean;
         profile: string;
         connection: "bluetooth" | "usb";
     };
@@ -554,6 +556,16 @@ function Content() {
                             }
                         />
                     </PanelSectionRow>
+                    <PanelSectionRow>
+                        <ToggleField
+                            label="Keep the Deck awake while connected"
+                            description="Turns off the Deck's sleep timer while connected, it doesn't see you using it otherwise."
+                            checked={s.options.keep_awake}
+                            onChange={async (v) =>
+                                setState(await setOption("keep_awake", v))
+                            }
+                        />
+                    </PanelSectionRow>
                     {hasQam && (
                         <PanelSectionRow>
                             <ToggleField
@@ -576,7 +588,10 @@ function Content() {
 
 export default definePlugin(() => {
     let lastState: State["state"] = "off";
+    // Also puts the sleep timers back if Steam or the plugin went down while connected.
+    getState().then((s) => keepAwake(s.state === "connected" && s.options.keep_awake));
     const stateListener = addEventListener<[State]>("state", (s) => {
+        keepAwake(s.state === "connected" && s.options.keep_awake);
         if (s.state === "connected" && lastState !== "connected") {
             // The Deck's controller now belongs to the host, so the menu can't be used anyway.
             Navigation.CloseSideMenus();
@@ -605,6 +620,7 @@ export default definePlugin(() => {
         content: <Content />,
         icon: <FaGamepad />,
         onDismount() {
+            keepAwake(false);
             routerHook.removeGlobalComponent("DeckAsControllerBlanker");
             disposeBlanker();
             removeEventListener("state", stateListener);
