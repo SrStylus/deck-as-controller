@@ -14,7 +14,7 @@ from sdcd.profiles import DEFAULT_PROFILE, profile_list
 
 SYSTEM_PYTHON = "/usr/bin/python3"
 DEFAULT_OPTIONS = {"screen_off": True, "pad_haptics": True, "qam_to_host": False,
-                   "profile": DEFAULT_PROFILE, "connection": "bluetooth"}
+                   "keep_awake": True, "profile": DEFAULT_PROFILE, "connection": "bluetooth"}
 # Options that change the daemon's identity or transport; changing them restarts it.
 RESTART_OPTIONS = ("profile", "connection")
 PROFILES = profile_list()

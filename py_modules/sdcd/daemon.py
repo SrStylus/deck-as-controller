@@ -5,7 +5,8 @@ Talks to the Decky plugin over stdio using JSON lines:
   stdin  commands: {"cmd": "pair"} | {"cmd": "stop"} | {"cmd": "screen"}
                    {"cmd": "connect", "address": str (optional)}
                    {"cmd": "forget", "address": str}
-                   {"cmd": "options", "screen_off": bool, "pad_haptics": bool, "qam_to_host": bool}
+                   {"cmd": "options", "screen_off": bool, "pad_haptics": bool, "qam_to_host": bool,
+                    "keep_awake": bool}
   stdout events:   {"type": "state", ...} | {"type": "error", "message": str}
                    {"type": "stopped", "reason": str}
 The controller type ("profile") sets the Bluetooth identity, so it's fixed for
@@ -37,7 +38,7 @@ QAM_TAP_MAX = 0.6  # seconds: tap ⋯ toggles the screen
 QAM_HOLD_STOP = 2.0  # seconds: hold ⋯ stops controller mode
 BATTERY = "/sys/class/power_supply/BAT1"
 BT_ADDRESS = "/sys/class/bluetooth/hci0/address"
-RUNTIME_OPTIONS = ("screen_off", "pad_haptics", "qam_to_host")
+RUNTIME_OPTIONS = ("screen_off", "pad_haptics", "qam_to_host", "keep_awake")
 USB_POLL = 0.5  # seconds between checks for a computer on the USB cable
 
 
@@ -95,7 +96,8 @@ def bt_address_bytes() -> bytes:
 class Daemon:
     def __init__(self, settings_dir: str, options: dict):
         self.options = {"screen_off": True, "pad_haptics": True, "qam_to_host": False,
-                        "profile": DEFAULT_PROFILE, "connection": "bluetooth", **options}
+                        "keep_awake": True, "profile": DEFAULT_PROFILE, "connection": "bluetooth",
+                        **options}
         self.usb = self.options["connection"] == "usb"
         self.profile = get_profile(self.options["profile"])
         if self.usb and not self.profile.usb_descriptor:
