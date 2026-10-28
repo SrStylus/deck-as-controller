@@ -111,6 +111,8 @@ INTERVAL = 4  # bInterval at high speed: 2^(4-1) x 125 us = 1 ms
 # f_hid (Linux 6.12+): preload GET_REPORT answers. struct usb_hidg_report is report_id u8,
 # userspace_req u8 (0 = answer every future request), length u16, data[64], pad[4].
 GADGET_HID_WRITE_GET_REPORT = 0x40000000 | (72 << 16) | (ord("g") << 8) | 0x42
+# Which report a GET_REPORT the kernel is holding for us is for (userspace_req = 1).
+GADGET_HID_READ_GET_REPORT_ID = 0x80000000 | (1 << 16) | (ord("g") << 8) | 0x41
 FEATURE_REPORTS = (0x05, 0x09, 0x20)
 
 
@@ -142,7 +144,7 @@ def create_gadget(profile: Profile, mac: bytes = b""):
         os.system("mount -t configfs none /sys/kernel/config")
     GADGET.mkdir()
     _write(GADGET / "idVendor", hex(profile.vendor_id))
-    _write(GADGET / "idProduct", hex(profile.product_id))
+    _write(GADGET / "idProduct", hex(profile.usb_product_id or profile.product_id))
     _write(GADGET / "bcdDevice", "0x0100")
     _write(GADGET / "bcdUSB", "0x0200")
     _write(GADGET / "max_speed", "high-speed")
@@ -162,6 +164,8 @@ def create_gadget(profile: Profile, mac: bytes = b""):
     _write(hid / "report_length", REPORT_LENGTH)
     _write(hid / "interval", INTERVAL)
     _write(hid / "report_desc", profile.usb_descriptor)
+    if profile.usb_set_report:
+        _write(hid / "no_out_endpoint", 1)  # otherwise f_hid stalls SET_REPORT
     (config / "hid.usb0").symlink_to(hid)
     _write(GADGET / "UDC", udc_name())
     log.info("USB gadget ready as %s", profile.bt_name)
@@ -193,13 +197,20 @@ def host_connected() -> bool:
         return False
 
 
+def _set_get_report(fd: int, report_id: int, data: bytes, live: bool):
+    fcntl.ioctl(fd, GADGET_HID_WRITE_GET_REPORT,
+                struct.pack("<BBH64s4x", report_id, int(live), len(data), data))
+
+
 def open_hidg(profile: Profile, mac: bytes) -> int:
     fd = os.open(HIDG, os.O_RDWR | os.O_NONBLOCK)
     for report_id in FEATURE_REPORTS:
         data = profile.feature_report(report_id, mac)
         if data:
-            fcntl.ioctl(fd, GADGET_HID_WRITE_GET_REPORT,
-                        struct.pack("<BBH64s4x", report_id, 0, len(data), data))
+            _set_get_report(fd, report_id, data, live=False)
+    for report_id in profile.usb_live_features:
+        # the kernel holds these requests until we answer them in Link
+        _set_get_report(fd, report_id, bytes([report_id]), live=True)
     return fd
 
 
@@ -210,10 +221,13 @@ class Link:
     unplugged = False
     closed_by_host = False
 
-    def __init__(self, fd: int, profile: Profile, get_report: Callable[[], bytes],
-                 on_rumble: Callable[[int, int, float | None], None]):
-        self.fd, self.profile = fd, profile
+    def __init__(self, fd: int, profile: Profile, mac: bytes, get_report: Callable[[], bytes],
+                 on_rumble: Callable[[int, int, float | None], None],
+                 on_haptic: Callable[[bytes], None], on_output: Callable[[bytes], None]):
+        self.fd, self.profile, self.mac = fd, profile, mac
         self.get_report, self.on_rumble = get_report, on_rumble
+        self.on_haptic, self.on_output = on_haptic, on_output
+        self.last_rumble: tuple[int, int] = (0, 0)
         self.alive = threading.Event()
         self.alive.set()
         self.new_input = threading.Condition()
@@ -228,7 +242,11 @@ class Link:
         self.notify_input()
 
     def send_extra(self, report: bytes):
-        pass  # the USB types have no side reports
+        """An occasional input report (e.g. battery), with its report ID."""
+        try:
+            os.write(self.fd, report)
+        except OSError:
+            pass
 
     def run(self):
         threading.Thread(target=self._rx_loop, daemon=True, name="usb-rx").start()
@@ -240,6 +258,7 @@ class Link:
     def _send_loop(self):
         # USB has no queue to keep short: the host polls every 1 ms and f_hid holds one
         # report, so send each new Deck report (and the IMU at least every report_interval).
+        last_id = None
         while self.alive.is_set():
             with self.new_input:
                 self.new_input.wait(timeout=self.profile.report_interval)
@@ -251,8 +270,14 @@ class Link:
                 if not host_connected():
                     break
                 continue
+            report = self.profile.usb_report(self.get_report())
+            if not report:  # e.g. a switch pro that hasn't finished its usb handshake
+                continue
+            if report[0] != last_id or self.sent < 40:  # the handshake and mode changes
+                log.debug("usb report to host %dB: %s", len(report), report[:16].hex(" "))
+                last_id = report[0]
             try:
-                os.write(self.fd, self.profile.usb_report(self.get_report()))
+                os.write(self.fd, report)
                 self.sent += 1
             except BlockingIOError:
                 self.skipped += 1
@@ -262,15 +287,51 @@ class Link:
 
     def _rx_loop(self):
         while self.alive.is_set():
-            readable, _, _ = select.select([self.fd], [], [], 0.2)
-            if not readable:
-                continue
+            readable, _, pending = select.select([self.fd], [], [self.fd], 0.2)
             try:
-                msg = os.read(self.fd, REPORT_LENGTH)
-            except BlockingIOError:
-                continue
+                # read first: a GET_REPORT usually answers the SET_REPORT just before it
+                while readable:
+                    try:
+                        msg = os.read(self.fd, REPORT_LENGTH)
+                    except BlockingIOError:
+                        break
+                    if msg:
+                        self._handle_report(msg)
+                    readable, _, _ = select.select([self.fd], [], [], 0)
+                if pending:
+                    self._answer_get_report()
             except OSError:
                 break
-            rumble = self.profile.parse_usb_rumble(msg)
-            if rumble:
-                self.on_rumble(*rumble)
+
+    def _answer_get_report(self):
+        asked = bytearray(1)
+        fcntl.ioctl(self.fd, GADGET_HID_READ_GET_REPORT_ID, asked)
+        report_id = asked[0]
+        data = self.profile.feature_report(report_id, self.mac) or bytes([report_id])
+        _set_get_report(self.fd, report_id, data, live=report_id in self.profile.usb_live_features)
+
+    def _handle_report(self, msg: bytes):
+        """An output or feature report from the host (starts with the report ID)."""
+        log.debug("usb report from host %dB: %s", len(msg), msg[:16].hex(" "))
+        rumble = self.profile.parse_usb_rumble(msg)
+        if rumble:
+            self.on_rumble(*rumble)
+            return
+        # Same shape as over Bluetooth, so the profile's parsers work for both.
+        if msg[0] in self.profile.usb_live_features:
+            self.profile.set_feature(msg)
+            msg = b"\xA3" + msg
+        else:
+            msg = b"\xA2" + msg
+        self.on_output(msg)
+        haptic = self.profile.parse_haptic(msg)
+        if haptic is not None:
+            self.on_haptic(haptic)
+            return
+        rumble = self.profile.parse_rumble(msg)
+        if rumble is None:
+            return
+        low, high, duration = rumble
+        if duration is not None or (low, high) != self.last_rumble:
+            self.last_rumble = (low, high)
+            self.on_rumble(low, high, duration)

@@ -24,6 +24,9 @@ class Encoder:
     def start_bluetooth(self):
         """This encoder is for a Bluetooth connection (not USB)."""
 
+    def start_usb(self):
+        """This encoder is for a USB connection (not Bluetooth)."""
+
 
 class Profile:
     """An emulated controller type: its Bluetooth identity and report protocol."""
@@ -47,6 +50,13 @@ class Profile:
     # Wired (USB gadget) support: the controller's USB HID descriptor, or empty if
     # this type only works over Bluetooth.
     usb_descriptor: bytes = b""
+    # Product ID of the wired controller, if it's not the same as over Bluetooth.
+    usb_product_id: int | None = None
+    # The wired controller has no OUT endpoint: the host sends output and feature
+    # reports with SET_REPORT instead.
+    usb_set_report: bool = False
+    # Feature reports whose answer depends on what the host wrote before (answered live).
+    usb_live_features: tuple[int, ...] = ()
 
     def new_encoder(self) -> Encoder:
         raise NotImplementedError
@@ -82,7 +92,7 @@ class Profile:
         return []
 
     def usb_report(self, report: bytes) -> bytes:
-        """The USB input report for an encoded (Bluetooth) input report."""
+        """The USB input report for an encoded (Bluetooth) input report, or b"" to send nothing."""
         raise NotImplementedError
 
     def parse_usb_rumble(self, msg: bytes) -> tuple[int, int, float | None] | None:

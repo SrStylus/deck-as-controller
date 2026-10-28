@@ -93,6 +93,20 @@ def bt_address_bytes() -> bytes:
         return bytes(6)
 
 
+def wired_address() -> bytes:
+    """An address for wired mode: the Bluetooth one, or (Bluetooth off, so no address to
+    read) a stable made up one from the machine id. A Switch won't take all zeros."""
+    mac = bt_address_bytes()
+    if any(mac):
+        return mac
+    try:
+        with open("/etc/machine-id") as f:
+            mid = bytes.fromhex(f.read().strip()[:12])
+    except (OSError, ValueError):
+        mid = b"\x5d\xec\xca\x5c\x00\x01"
+    return bytes([(mid[0] | 0x02) & 0xFE]) + mid[1:6]  # locally administered, unicast
+
+
 class Daemon:
     def __init__(self, settings_dir: str, options: dict):
         self.options = {"screen_off": True, "pad_haptics": True, "qam_to_host": False,
@@ -334,12 +348,12 @@ class Daemon:
         if not usb.udc_name():
             raise RuntimeError("USB mode is off. Turn it on in the plugin (the Deck restarts), "
                                "or set USB Dual Role Device to DRD in the BIOS.")
-        usb.create_gadget(self.profile, bt_address_bytes())
+        usb.create_gadget(self.profile, wired_address())
         for _ in range(50):  # /dev/hidg0 appears once udev has seen the gadget
             if os.path.exists(usb.HIDG):
                 break
             time.sleep(0.1)
-        self.usb_fd = usb.open_hidg(self.profile, bt_address_bytes())
+        self.usb_fd = usb.open_hidg(self.profile, wired_address())
 
     def _usb_loop(self):
         """Wired mode: start a session whenever a computer has set up the controller."""
@@ -354,10 +368,14 @@ class Daemon:
                 return
             deck = DeckController()
             encoder = self.profile.new_encoder()
+            encoder.start_usb()
             latest = SharedInput()
-            link = usb.Link(self.usb_fd, self.profile,
+            mac = wired_address()
+            link = usb.Link(self.usb_fd, self.profile, mac,
                             get_report=lambda: encoder.encode(latest.take(), self.battery),
-                            on_rumble=lambda low, high, duration: _safe(deck.rumble, low, high, duration))
+                            on_rumble=lambda low, high, duration: _safe(deck.rumble, low, high, duration),
+                            on_haptic=lambda cmd: _safe(deck.haptic, cmd),
+                            on_output=lambda msg: encoder.handle_output(msg, mac))
             self.link = link
             self.encoder = encoder
             self.session_thread = threading.Thread(target=self._session, args=(link, deck, latest),
