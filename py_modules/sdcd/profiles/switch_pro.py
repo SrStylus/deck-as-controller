@@ -37,6 +37,19 @@ DESCRIPTOR = bytes([
     0xC0,
 ])
 
+# Wired: a joystick collection of 63 byte vendor reports. Inputs 0x21 subcommand reply,
+# 0x30 state, 0x81 usb command reply; outputs 0x01 rumble + subcommand, 0x10 rumble,
+# 0x80 usb command, 0x82 (unused).
+USB_DESCRIPTOR = (
+    bytes([0x05, 0x01, 0x09, 0x04, 0xA1, 0x01, 0x06, 0x01, 0xFF, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08])
+    + b"".join(bytes([0x85, rid, 0x09, rid, 0x95, 0x3F, 0x81, 0x02]) for rid in (0x21, 0x30, 0x81))
+    + b"".join(bytes([0x85, rid, 0x09, rid, 0x95, 0x3F, 0x91, 0x02]) for rid in (0x01, 0x10, 0x80, 0x82))
+    + bytes([0xC0])
+)
+USB_REPORT_LEN = 64
+# Wired-only commands (output 0x80 <command>), answered with input 0x81 <command> ...
+USB_STATUS, USB_HANDSHAKE, USB_HIGH_SPEED, USB_FORCE, USB_CLEAR = 0x01, 0x02, 0x03, 0x04, 0x05
+
 # Sticks are 12 bit.
 STICK_CENTER, STICK_RANGE = 0x800, 0x700
 # IMU calibration of real controllers, for hosts that read it (no IMU data is sent).
@@ -48,6 +61,7 @@ COLOURS = bytes([0x32, 0x32, 0x32, 0xFF, 0xFF, 0xFF, 0x32, 0x32, 0x32, 0x32, 0x3
 # Subcommands (output report 0x01, byte 10)
 SUB_DEVICE_INFO, SUB_INPUT_MODE, SUB_TRIGGER_ELAPSED = 0x02, 0x03, 0x04
 SUB_HCI_STATE, SUB_SPI_READ = 0x06, 0x10
+SUB_MCU_CONFIG = 0x21
 HCI_DISCONNECT = 0x00  # SUB_HCI_STATE argument: disconnect, sent by a Switch going to sleep
 
 
@@ -94,8 +108,18 @@ class SwitchProEncoder(Encoder):
         self.timer = 0
         self.full = False  # host asked for full 0x30 reports
         self.replies: deque[tuple[int, int, bytes]] = deque()  # (ack, subcommand, data)
+        self.last_simple = self._simple(None)
+        self.usb = False
+        self.usb_ready = False  # the host sent "force usb", now stream like over bluetooth
+        self.usb_replies: deque[bytes] = deque()
+
+    def start_usb(self):
+        self.usb = True
 
     def handle_output(self, msg: bytes, mac: bytes):
+        if self.usb and len(msg) >= 3 and msg[:2] == b"\xA2\x80":
+            self._usb_command(msg[2], mac)
+            return
         # a2 01 <counter> <rumble x8> <subcommand> <args...>
         if len(msg) < 12 or msg[0] != 0xA2 or msg[1] != 0x01:
             return
@@ -113,14 +137,44 @@ class SwitchProEncoder(Encoder):
             self.replies.append((0x80, sub, b""))
         elif sub == SUB_TRIGGER_ELAPSED:
             self.replies.append((0x83, sub, b""))
+        elif sub == SUB_MCU_CONFIG:
+            # the switch wants the nfc/ir chip status here, a bare ack makes it drop us
+            # (same reply joycontrol and nxbt send, last byte is its crc)
+            self.replies.append((0xA0, sub, bytes([0x01, 0x00, 0xFF, 0x00, 0x08, 0x00, 0x1B, 0x01])
+                                 + bytes(25) + b"\xC8"))
         else:  # player/home lights, rumble enable, low power, ...: just acknowledge
             self.replies.append((0x80, sub, b""))
 
+    def _usb_command(self, cmd: int, mac: bytes):
+        # SDL sends handshake, high speed, handshake, force usb. A real Switch sends clear,
+        # status, handshake and then goes straight to subcommands, no force usb.
+        if cmd == USB_STATUS:  # <0> <type 3: pro controller> <address, little endian>
+            self.usb_replies.append(bytes([0x81, cmd, 0x00, 0x03]) + mac[::-1])
+        elif cmd in (USB_HANDSHAKE, USB_HIGH_SPEED):
+            self.usb_replies.append(bytes([0x81, cmd]))
+        elif cmd == USB_FORCE:  # no reply
+            self.usb_ready = self.full = True
+        elif cmd == USB_CLEAR:
+            self.usb_ready = False
+
     def encode(self, d: DeckInput | None, battery: Battery) -> bytes:
+        if self.usb:
+            if self.usb_replies:
+                return self.usb_replies.popleft()
+            # subcommand replies go out right away, streaming waits for force usb or 0x30 mode
+            if not (self.usb_ready or self.replies or self.full):
+                return b""
         self.timer = (self.timer + 1) & 0xFF
         reply = self.replies.popleft() if self.replies else None
         if reply is None and not self.full:
-            return self._simple(d)
+            # a real one only sends 0x3F when a button changes. streaming it non stop
+            # while the switch is still setting it up is probably why it drops us
+            # (nxbt and joycontrol also stay quiet until then)
+            simple = self._simple(d) if d is not None else self.last_simple
+            if simple == self.last_simple:
+                return b""
+            self.last_simple = simple
+            return simple
         r = bytearray(REPORT_LEN)
         r[1] = self.timer
         # Battery: high nibble 8 full, 6 medium, 4 low, 2 critical, 0 empty; +1 charging
@@ -196,9 +250,13 @@ class SwitchPro(Profile):
     provider = "Nintendo"
     descriptor = DESCRIPTOR
     report_interval = 0.015  # real controllers send full reports every 15 ms
+    usb_descriptor = USB_DESCRIPTOR
 
     def new_encoder(self) -> Encoder:
         return SwitchProEncoder()
+
+    def usb_report(self, report: bytes) -> bytes:
+        return report.ljust(USB_REPORT_LEN, b"\0") if report else b""
 
     def host_disconnect(self, msg: bytes) -> bool:
         # a2 01 <counter> <rumble x8> 06 00

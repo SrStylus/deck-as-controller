@@ -149,6 +149,9 @@ class Link:
                     time.sleep(0.0005)  # poll for the controller's ack
                     continue
                 report = self.get_report()
+                if not report:  # nothing to say (a switch pro before it's set up)
+                    last_send = time.monotonic()
+                    continue
                 if len(report) != report_len:  # e.g. a ps5 switching to full reports
                     per_report, report_len = None, len(report)
                 try:
